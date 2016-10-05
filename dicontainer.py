@@ -1,20 +1,41 @@
 import inspect
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 from collections import deque
-from typing import MutableMapping, TypeVar, Generic, Type, Set, List
+from typing import MutableMapping, TypeVar, Generic, Type, Set, List, Any, Mapping, Hashable, Dict
 
 import pytest  # type: ignore
 
 
-U = TypeVar('U')
+T = TypeVar('T')
+
+
+class Key(Hashable):
+    def __init__(self, interface: Type[Any], annotation=None) -> None:
+        self.interface = interface
+        self.annotation = annotation
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Key):
+            return False
+        return self.interface == other.interface and self.annotation == other.annotation
+
+    def __hash__(self) -> int:
+        return hash((self.interface, self.annotation))
+
+    def __repr__(self) -> str:
+        return '<Key (interface={!r}, annotation={!r})>'.format(self.interface, self.annotation)
 
 
 class Container:
-    def __init__(self, *configurations):
+    def __init__(self, *configurations: Any) -> None:
         self._providers = {}  # type: MutableMapping[Key, Provider]
         binder = Binder()
         for conf in configurations:
             conf(binder)
+        # bind defaults
+        binder.bind(Container).to_instance(self)
+
+        # build keys-bindings map
         sorted_bindings = binder.sorted_bindings
         keys_to_bindings = {}  # type: MutableMapping[Key, Binding]
         sorted_keys = []  # type: List[Key]
@@ -26,7 +47,6 @@ class Container:
         for binding in sorted_bindings:
             key = binding.key
             possible_link = binding.linked_to
-
             while (
                 possible_link is not None and  # has link
                 key != possible_link and  # not linked to self
@@ -35,19 +55,38 @@ class Container:
                 keys_to_bindings[key] = keys_to_bindings[possible_link]
                 possible_link = keys_to_bindings[possible_link].linked_to
 
+        # build keys-providers map
         for key in sorted_keys:
-            self._providers[key] = keys_to_bindings[key].create_provider(self._providers)
+            # add provider for key
+            provider = keys_to_bindings[key].create_provider(self._providers)
+            self._providers[key] = provider
+            # also add provider for provider for key (huh!)
+            provider_interface = Provider[key.interface]  # type: ignore
+            provider_key = Key(provider_interface, key.annotation)
 
-    def get(self, cls: Type[U]) -> U:
+            # TODO: is this correct that silently don't do anything
+            # if provider for such key was already provided by user?
+            if provider_key not in self._providers:
+                self._providers[provider_key] = InstanceProvider(provider)
+
+        # initialize lazy providers
+        for key, lazy_provider in binder._lazy_initialized_providers.items():
+            try:
+                provider = self._providers[key]
+            except KeyError:
+                raise KeyNotBoundError(key)
+            lazy_provider.initialize(provider)
+
+    def get(self, cls: Type[T]) -> T:
         return self.get_provider(cls).get()
 
-    def get_provider(self, cls: Type[U]) -> 'Provider[U]':
+    def get_provider(self, cls: Type[T]) -> 'Provider[T]':
         key = Key(cls)
         providers_map = self._providers
         try:
             provider = providers_map[key]
         except KeyError:
-            raise ValueError(key)
+            raise KeyNotBoundError(key)
         return provider
 
 
@@ -55,7 +94,12 @@ class DuplicateBindingError(Exception):
     pass
 
 
-T = TypeVar('T')
+class KeyNotBoundError(Exception):
+    pass
+
+
+class IllegalStateException(Exception):
+    pass
 
 
 class Provider(Generic[T], ABC):
@@ -67,9 +111,111 @@ class Provider(Generic[T], ABC):
 class Binding(ABC):
     linked_to = None  # type: Key
 
+    @abstractproperty
+    def key(self) -> Key: ...
+
+    @abstractproperty
+    def dependencies(self) -> Set: ...
+
+    @abstractmethod
+    def create_provider(self, providers: Mapping[Key, Provider]) -> Provider:
+        pass
+
+
+class ClassBinding(Binding):
+    def __init__(self, interface, cls) -> None:
+        assert inspect.isclass(cls), cls
+        assert issubclass(cls, interface), (cls, interface)
+        self.cls = cls
+        self._key = Key(interface)
+        self.linked_to = Key(cls)
+
+    @property
+    def key(self) -> Key:
+        return self._key
+
+    @property
+    def dependencies(self) -> Set[Key]:
+        return set(get_keys_from_constructor(self.cls.__init__).values())
+
+    def create_provider(self, providers: Mapping[Key, Provider]):
+        return ClassProvider(self.cls, providers)
+
+
+def get_keys_from_constructor(ctor) -> Mapping[str, Key]:
+    if ctor is object.__init__:
+        return {}
+    sig = inspect.signature(ctor)
+    param_names_to_keys = {}
+    for parameter_name in list(sig.parameters.keys())[1:]:  # skip first param (self)
+        parameter = sig.parameters[parameter_name]
+        if parameter.annotation is inspect.Parameter.empty:
+            raise ValueError('parameter {} has no annotation'.format(parameter.name))
+        param_names_to_keys[parameter.name] = Key(parameter.annotation)
+    return param_names_to_keys
+
+
+class ClassProvider(Provider[T], Generic[T]):
+    def __init__(self, cls: Type[T], providers) -> None:
+        self.cls = cls
+        self.parameters = self._bind_parameters(providers)
+
+    def _bind_parameters(self, providers):
+        param_names_to_keys = get_keys_from_constructor(self.cls.__init__)
+        return {
+            name: providers[key]
+            for name, key in param_names_to_keys.items()
+        }
+
+    def get(self) -> T:
+        params = {name: provider.get() for name, provider in self.parameters.items()}
+        return self.cls(**params)  # type: ignore
+
+
+class InstanceBinding(Binding):
+    def __init__(self, interface: Type[T], instance: T) -> None:
+        assert isinstance is not None
+        assert isinstance(instance, interface)
+        self._instance = instance
+        self._key = Key(interface)
+
+    @property
+    def key(self) -> Key:
+        return self._key
+
+    @property
+    def dependencies(self) -> Set:
+        return set()
+
+    def create_provider(self, bindings) -> Provider[T]:
+        return InstanceProvider(self._instance)
+
+
+class InstanceProvider(Provider[T], Generic[T]):
+    def __init__(self, instance: T) -> None:
+        self.instance = instance
+
+    def get(self) -> T:
+        return self.instance
+
+
+class LazyProvider(Provider[T], Generic[T]):
+    def __init__(self) -> None:
+        self._underlying_provider = None  # type: Provider[T]
+
+    def get(self) -> T:
+        provider = self._underlying_provider  # type: Provider[T]
+        if provider is None:
+            raise IllegalStateException
+        return provider.get()
+
+    def initialize(self, provider: Provider[T]) -> None:
+        assert provider is not None
+        self._underlying_provider = provider
+
 
 class BindingBuilder(object):
-    def __init__(self, interface):
+    def __init__(self, interface) -> None:
         self.interface = interface
         self._binding = None  # type: Binding
 
@@ -83,93 +229,27 @@ class BindingBuilder(object):
         if self._binding is not None:
             raise RuntimeError('binding already set')
         self._binding = binding
-        return self._binding
 
-    def to(self, impl):
-        return self._set_binding(ClassBinding(self.interface, impl))
+    def to(self, impl) -> ClassBinding:
+        b = ClassBinding(self.interface, impl)
+        self._set_binding(b)
+        return b
 
-    def to_instance(self, instance):
-        return self._set_binding(InstanceBinding(self.interface, instance))
-
-
-class ClassBinding(Binding):
-    def __init__(self, interface, cls):
-        assert inspect.isclass(cls), cls
-        assert issubclass(cls, interface), (cls, interface)
-        self.interface = interface
-        self.cls = cls
-        self.key = Key(interface)
-        self.linked_to = Key(cls)
-
-    @property
-    def dependencies(self) -> 'Set[Key]':
-        return set(get_keys_from_constructor(self.cls.__init__).values())
-
-    def create_provider(self, bindings):
-        return ClassProvider(self.cls, bindings)
-
-
-def get_keys_from_constructor(ctor):
-    if ctor is object.__init__:
-        return {}
-    sig = inspect.signature(ctor)
-    param_names_to_keys = {}
-    for parameter_name in list(sig.parameters.keys())[1:]:  # skip first param (self)
-        parameter = sig.parameters[parameter_name]
-        if parameter.annotation is inspect.Parameter.empty:
-            raise ValueError('parameter {} has no annotation'.format(parameter.name))
-        param_names_to_keys[parameter.name] = Key(parameter.annotation)
-    return param_names_to_keys
-
-
-class ClassProvider(Provider):
-    def __init__(self, cls, bindings):
-        self.cls = cls
-        self.parameters = self._bind_parameters(bindings)
-
-    def _bind_parameters(self, bindings):
-        param_names_to_keys = get_keys_from_constructor(self.cls.__init__)
-        return {
-            name: bindings[key]
-            for name, key in param_names_to_keys.items()
-        }
-
-    def get(self):
-        return self.cls(**{name: provider.get() for name, provider in self.parameters.items()})
-
-
-class InstanceBinding(Binding):
-    def __init__(self, interface, instance):
-        assert isinstance is not None
-        assert isinstance(instance, interface)
-        self.interface = interface
-        self.instance = instance
-        self.key = Key(interface)
-
-    @property
-    def dependencies(self):
-        return set()
-
-    def create_provider(self, bindings):
-        return InstanceProvider(self.instance)
-
-
-class InstanceProvider(Provider):
-    def __init__(self, instance):
-        self.instance = instance
-
-    def get(self):
-        return self.instance
+    def to_instance(self, instance) -> InstanceBinding:
+        b = InstanceBinding(self.interface, instance)
+        self._set_binding(b)
+        return b
 
 
 class Binder:
-    def __init__(self):
+    def __init__(self) -> None:
         self._binding_builders = []  # type: List[BindingBuilder]
+        self._lazy_initialized_providers = {}  # type: Dict[Key, LazyProvider]
 
     @property
-    def sorted_bindings(self):
+    def sorted_bindings(self) -> List[Binding]:
         bindings = [b.binding for b in self._binding_builders]
-        keys_to_bindings = {}
+        keys_to_bindings = {}  # type: Dict[Key, Binding]
         for binding in bindings:
             key = binding.key
             if key in keys_to_bindings:
@@ -184,22 +264,19 @@ class Binder:
         self._binding_builders.append(builder)
         return builder
 
-
-class Key:
-    def __init__(self, interface, annotation=None):
-        self.interface = interface
-        self.annotation = annotation
-
-    def __eq__(self, other):
-        if not isinstance(other, Key):
-            return False
-        return self.interface is other.interface and self.annotation == other.annotation
-
-    def __hash__(self):
-        return hash((self.interface, self.annotation))
-
-    def __repr__(self):
-        return '<Key ({})>'.format(self.interface)
+    def get_provider(self, interface: Type[T], annotation=None) -> Provider[T]:
+        """
+        May be used to resolve circular dependencies.
+        Returns a provider proxy that is initialized upon DI container creation.
+        If attempted to request an instance before the container is
+        constructed, the provider with raise `IllegalStateException` exception.
+        """
+        key = Key(interface, annotation)
+        try:
+            provider = self._lazy_initialized_providers[key]
+        except KeyError:
+            provider = self._lazy_initialized_providers[key] = LazyProvider()
+        return provider
 
 
 def topsorted(node_to_dependencies):
@@ -344,3 +421,43 @@ def test_duplicate_binding():
 
     with pytest.raises(DuplicateBindingError):
         Container(configure)
+
+
+def test_container_provides_self():
+    c = Container()
+    assert c.get(Container) is c
+
+
+def test_provides_provider():
+    def configure(binder):
+        binder.bind(int).to_instance(1)
+
+    c = Container(configure)
+
+    int_provider = c.get(Provider[int])  # type: ignore
+    assert int_provider.get() == 1
+
+
+def test_key():
+    k1 = Key(List[int])  # type: ignore
+    k2 = Key(List[int])  # type: ignore
+    assert k1 == k2
+    assert hash(k2) == hash(k2)
+
+
+def test_binder_get_provider():
+    class A:
+        pass
+
+    def configure(binder):
+        provider = binder.get_provider(int)
+        with pytest.raises(IllegalStateException):
+            provider.get()
+        binder.bind(int).to_instance(1)
+        a = A()
+        a.provider = provider
+        binder.bind(A).to_instance(a)
+
+    a = Container(configure).get(A)
+
+    assert a.provider.get() == 1
