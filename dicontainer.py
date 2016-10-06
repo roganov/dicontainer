@@ -57,17 +57,8 @@ class Container:
 
         # build keys-providers map
         for key in sorted_keys:
-            # add provider for key
             provider = keys_to_bindings[key].create_provider(self._providers)
             self._providers[key] = provider
-            # also add provider for provider for key (huh!)
-            provider_interface = Provider[key.interface]  # type: ignore
-            provider_key = Key(provider_interface, key.annotation)
-
-            # TODO: is this correct that silently don't do anything
-            # if provider for such key was already provided by user?
-            if provider_key not in self._providers:
-                self._providers[provider_key] = InstanceProvider(provider)
 
         # initialize lazy providers
         for key, lazy_provider in binder._lazy_initialized_providers.items():
@@ -115,11 +106,41 @@ class Binding(ABC):
     def key(self) -> Key: ...
 
     @abstractproperty
-    def dependencies(self) -> Set: ...
+    def dependencies(self) -> Set[Key]: ...
 
     @abstractmethod
+    def create_provider(self, providers: Mapping[Key, Provider]) -> Provider: ...
+
+
+def provider_key(key: Key) -> Key:
+    provider_interface = Provider[key.interface]  # type: ignore
+    return Key(provider_interface, key.annotation)
+
+
+class ProviderBinding(Binding):
+    def __init__(self, internal_binding: Binding) -> None:
+        self._internal_binding = internal_binding
+        self._key = provider_key(internal_binding.key)
+
+        if self._internal_binding.linked_to:
+            self._linked_to = provider_key(self._internal_binding.linked_to)
+        else:
+            self._linked_to = None
+
+    @property
+    def linked_to(self):
+        return self._linked_to
+
+    @property
+    def key(self):
+        return self._key
+
+    @property
+    def dependencies(self) -> Set[Key]:
+        return {self._internal_binding.key}
+
     def create_provider(self, providers: Mapping[Key, Provider]) -> Provider:
-        pass
+        return InstanceProvider(providers[self._internal_binding.key])
 
 
 class ClassBinding(Binding):
@@ -239,13 +260,14 @@ class BindingBuilder(object):
     def __init__(self, interface) -> None:
         self._binding = None  # type: Binding
         self._key = Key(interface)
-        self._scope = None
 
-        self._instance = None
-        self._impl = None
+        # TODO: try to come up with a narrower type
+        self._scope = None  # type: Any
 
-    @property
-    def binding(self) -> Binding:
+        self._instance = None  # type: Any
+        self._impl = None  # type: Any
+
+    def build(self) -> Binding:
         if self._instance:
             return InstanceBinding(self._key, self._instance)
         if self._impl:
@@ -292,16 +314,27 @@ class Binder:
 
     @property
     def sorted_bindings(self) -> List[Binding]:
-        bindings = [b.binding for b in self._binding_builders]
+        bindings = [b.build() for b in self._binding_builders]
         keys_to_bindings = {}  # type: Dict[Key, Binding]
         for binding in bindings:
             key = binding.key
             if key in keys_to_bindings:
                 raise DuplicateBindingError(key)
             keys_to_bindings[key] = binding
-        keys_dependencies_graph = {b.key: b.dependencies for b in bindings}
+        # add provider bindings
+        for binding in bindings:
+            provider_binding = ProviderBinding(binding)
+            if provider_binding.key not in keys_to_bindings:
+                keys_to_bindings[provider_binding.key] = provider_binding
+
+        keys_dependencies_graph = {
+            b.key: b.dependencies for b in keys_to_bindings.values()
+        }
         sorted_keys = topsorted(keys_dependencies_graph)
-        return [keys_to_bindings[key] for key in sorted_keys]
+        try:
+            return [keys_to_bindings[key] for key in sorted_keys]
+        except KeyError:
+            raise KeyNotBoundError(key)
 
     def bind(self, cls) -> AnnotatedBindingBuilder:
         builder = BindingBuilder(cls)
@@ -313,7 +346,8 @@ class Binder:
         May be used to resolve circular dependencies.
         Returns a provider proxy that is initialized upon DI container creation.
         If attempted to request an instance before the container is
-        constructed, the provider with raise `IllegalStateException` exception.
+        fully constructed, the return provider
+        will raise `IllegalStateException` exception.
         """
         key = Key(interface, annotation)
         try:
@@ -431,14 +465,28 @@ def test_linked_binding():
     class D(C):
         pass
 
+    class Dep:
+        def __init__(self, a: A) -> None:
+            self.a = a
+
     def configure(binder):
         binder.bind(A).to(B)
         binder.bind(B).to(C)
         binder.bind(C).to(D)
+        binder.bind(Dep)
 
     container = Container(configure)
+
+    # direct links
     assert type(container.get(A)) is D
     assert type(container.get(B)) is D
+
+    # providers links
+    assert type(container.get(Provider[A]).get()) is D  # type: ignore
+    assert type(container.get(Provider[B]).get()) is D  # type: ignore
+
+    # dependency link
+    assert type(container.get(Dep).a) is D
 
 
 def test_linked_to_instance():
@@ -505,3 +553,29 @@ def test_binder_get_provider():
     a = Container(configure).get(A)
 
     assert a.provider.get() == 1
+
+
+def test_dependency_on_provider():
+    class A:
+        def __init__(self, x: Provider[int]) -> None:
+            self.x = x
+
+    def configure(binder: Binder):
+        binder.bind(A)
+        binder.bind(int).to_instance(1)
+
+    c = Container(configure)
+
+    assert c.get(A).x.get() == 1
+
+
+def test_unknown_dependency():
+    class A:
+        def __init__(self, x: int) -> None:
+            pass
+
+    def configure(binder):
+        binder.bind(A)
+
+    with pytest.raises(KeyNotBoundError):
+        Container(configure)
