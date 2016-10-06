@@ -123,11 +123,11 @@ class Binding(ABC):
 
 
 class ClassBinding(Binding):
-    def __init__(self, interface, cls) -> None:
+    def __init__(self, key, cls) -> None:
         assert inspect.isclass(cls), cls
-        assert issubclass(cls, interface), (cls, interface)
+        assert issubclass(cls, key.interface), (cls, key.interface)
         self.cls = cls
-        self._key = Key(interface)
+        self._key = key
         self.linked_to = Key(cls)
 
     @property
@@ -173,11 +173,11 @@ class ClassProvider(Provider[T], Generic[T]):
 
 
 class InstanceBinding(Binding):
-    def __init__(self, interface: Type[T], instance: T) -> None:
+    def __init__(self, key: Key, instance: T) -> None:
         assert isinstance is not None
-        assert isinstance(instance, interface)
+        assert isinstance(instance, key.interface)
         self._instance = instance
-        self._key = Key(interface)
+        self._key = key
 
     @property
     def key(self) -> Key:
@@ -214,31 +214,75 @@ class LazyProvider(Provider[T], Generic[T]):
         self._underlying_provider = provider
 
 
+class ScopedBindingBuilder:
+    def __init__(self, builder: 'BindingBuilder') -> None:
+        self._builder = builder
+
+    def in_scope(self, scope) -> None:
+        self._builder.in_scope(scope)
+
+
+class LinkedBindingBuilder(ScopedBindingBuilder):
+    def to(self, impl) -> ScopedBindingBuilder:
+        return self._builder.to(impl)
+
+    def to_instance(self, instance) -> None:
+        self._builder.to_instance(instance)
+
+
+class AnnotatedBindingBuilder(LinkedBindingBuilder):
+    def annotated_with(self, annotation) -> LinkedBindingBuilder:
+        return self._builder.annotated_with(annotation)
+
+
 class BindingBuilder(object):
     def __init__(self, interface) -> None:
-        self.interface = interface
         self._binding = None  # type: Binding
+        self._key = Key(interface)
+        self._scope = None
+
+        self._instance = None
+        self._impl = None
 
     @property
     def binding(self) -> Binding:
-        if self._binding is None:
-            return ClassBinding(self.interface, self.interface)
-        return self._binding
+        if self._instance:
+            return InstanceBinding(self._key, self._instance)
+        if self._impl:
+            return ClassBinding(self._key, self._impl)
+
+        # TODO: check if interface is concrete class
+        return ClassBinding(self._key, self._key.interface)
+
+    def _check_not_bound(self):
+        if self._instance or self._impl:
+            raise RuntimeError('already bound')
 
     def _set_binding(self, binding: Binding):
         if self._binding is not None:
             raise RuntimeError('binding already set')
         self._binding = binding
 
-    def to(self, impl) -> ClassBinding:
-        b = ClassBinding(self.interface, impl)
-        self._set_binding(b)
-        return b
+    def annotated_with(self, annotation):
+        if self._key.annotation is not None:
+            raise RuntimeError(self._key)
+        self._key = Key(self._key.interface, annotation)
+        return LinkedBindingBuilder(self)
 
-    def to_instance(self, instance) -> InstanceBinding:
-        b = InstanceBinding(self.interface, instance)
-        self._set_binding(b)
-        return b
+    def in_scope(self, scope):
+        assert scope is not None
+        if self._scope is not None:
+            raise RuntimeError('scope already set')
+        self._scope = scope
+
+    def to(self, impl) -> ScopedBindingBuilder:
+        self._check_not_bound()
+        self._impl = impl
+        return ScopedBindingBuilder(self)
+
+    def to_instance(self, instance) -> None:
+        self._check_not_bound()
+        self._instance = instance
 
 
 class Binder:
@@ -259,10 +303,10 @@ class Binder:
         sorted_keys = topsorted(keys_dependencies_graph)
         return [keys_to_bindings[key] for key in sorted_keys]
 
-    def bind(self, cls):
+    def bind(self, cls) -> AnnotatedBindingBuilder:
         builder = BindingBuilder(cls)
         self._binding_builders.append(builder)
-        return builder
+        return AnnotatedBindingBuilder(builder)
 
     def get_provider(self, interface: Type[T], annotation=None) -> Provider[T]:
         """
