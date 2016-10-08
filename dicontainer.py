@@ -93,6 +93,10 @@ class IllegalStateException(Exception):
     pass
 
 
+class IllegalConfigurationError(Exception):
+    pass
+
+
 class Provider(Generic[T], ABC):
     @abstractmethod
     def get(self) -> T:
@@ -117,7 +121,11 @@ def provider_key(key: Key) -> Key:
     return Key(provider_interface, key.annotation)
 
 
-class ProviderBinding(Binding):
+class AutoProviderBinding(Binding):
+    """
+    Internal binding that is responsible for
+    binding providers
+    """
     def __init__(self, internal_binding: Binding) -> None:
         self._internal_binding = internal_binding
         self._key = provider_key(internal_binding.key)
@@ -144,6 +152,9 @@ class ProviderBinding(Binding):
 
 
 class ClassBinding(Binding):
+    """
+    Binding that binds interfaces to concrete classes
+    """
     def __init__(self, key, cls) -> None:
         assert inspect.isclass(cls), cls
         assert issubclass(cls, key.interface), (cls, key.interface)
@@ -194,6 +205,9 @@ class ClassProvider(Provider[T], Generic[T]):
 
 
 class InstanceBinding(Binding):
+    """
+    Binding that binds interface to an instance of this interface
+    """
     def __init__(self, key: Key, instance: T) -> None:
         assert isinstance is not None
         assert isinstance(instance, key.interface)
@@ -322,10 +336,11 @@ class Binder:
                 raise DuplicateBindingError(key)
             keys_to_bindings[key] = binding
         # add provider bindings
+
         for binding in bindings:
-            provider_binding = ProviderBinding(binding)
-            if provider_binding.key not in keys_to_bindings:
-                keys_to_bindings[provider_binding.key] = provider_binding
+            provider_binding = AutoProviderBinding(binding)
+            assert provider_binding.key not in keys_to_bindings, provider_binding
+            keys_to_bindings[provider_binding.key] = provider_binding
 
         keys_dependencies_graph = {
             b.key: b.dependencies for b in keys_to_bindings.values()
@@ -337,6 +352,10 @@ class Binder:
             raise KeyNotBoundError(key)
 
     def bind(self, cls) -> AnnotatedBindingBuilder:
+        if issubclass(cls, Provider):
+            raise IllegalConfigurationError(
+                'cannot bind provider {!r}, bind class and then request provider for this class'
+                .format(cls))
         builder = BindingBuilder(cls)
         self._binding_builders.append(builder)
         return AnnotatedBindingBuilder(builder)
@@ -579,3 +598,26 @@ def test_unknown_dependency():
 
     with pytest.raises(KeyNotBoundError):
         Container(configure)
+
+
+def test_binding_of_provider_is_disallowed():
+    def configure(binder):
+        binder.bind(Provider[int]).to_instance(InstanceProvider(1))
+
+    with pytest.raises(IllegalConfigurationError):
+        Container(configure)
+
+
+def test_bind_concrete_generic():
+    class A(Generic[T]):
+        pass
+
+    class AInt(A[int]):
+        pass
+
+    def configure(binder):
+        binder.bind(A[int]).to(AInt)
+
+    c = Container(configure)
+
+    assert type(c.get(A[int])) is AInt
