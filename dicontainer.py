@@ -121,10 +121,11 @@ def provider_key(key: Key) -> Key:
     return Key(provider_interface, key.annotation)
 
 
-class AutoProviderBinding(Binding):
+class ProviderBinding(Binding):
     """
     Internal binding that is responsible for
-    binding providers
+    binding providers.
+    This binding is used whenever Provider[T] is requested.
     """
     def __init__(self, internal_binding: Binding) -> None:
         self._internal_binding = internal_binding
@@ -161,6 +162,7 @@ class ClassBinding(Binding):
         self.cls = cls
         self._key = key
         self.linked_to = Key(cls)
+        self._class_injector = ClassInjectorHelper(self.cls)
 
     @property
     def key(self) -> Key:
@@ -168,10 +170,27 @@ class ClassBinding(Binding):
 
     @property
     def dependencies(self) -> Set[Key]:
-        return set(get_keys_from_constructor(self.cls.__init__).values())
+        return self._class_injector.dependencies
 
-    def create_provider(self, providers: Mapping[Key, Provider]):
-        return ClassProvider(self.cls, providers)
+    def create_provider(self, providers: Mapping[Key, Provider]) -> Provider:
+        return self._class_injector.create_provider(providers)
+
+
+class ClassInjectorHelper:
+    def __init__(self, cls):
+        self._cls = cls
+        self._param_names_to_keys = get_keys_from_constructor(cls.__init__)
+
+    @property
+    def dependencies(self) -> Set[Key]:
+        return set(self._param_names_to_keys.values())
+
+    def create_provider(self, providers: Mapping[Key, Provider]) -> Provider:
+        param_names_to_providers = {
+            name: providers[key]
+            for name, key in self._param_names_to_keys.items()
+        }
+        return ClassProvider(self._cls, param_names_to_providers)
 
 
 def get_keys_from_constructor(ctor) -> Mapping[str, Key]:
@@ -188,16 +207,9 @@ def get_keys_from_constructor(ctor) -> Mapping[str, Key]:
 
 
 class ClassProvider(Provider[T], Generic[T]):
-    def __init__(self, cls: Type[T], providers) -> None:
+    def __init__(self, cls: Type[T], parameters: Mapping[str, Provider]) -> None:
         self.cls = cls
-        self.parameters = self._bind_parameters(providers)
-
-    def _bind_parameters(self, providers):
-        param_names_to_keys = get_keys_from_constructor(self.cls.__init__)
-        return {
-            name: providers[key]
-            for name, key in param_names_to_keys.items()
-        }
+        self.parameters = parameters
 
     def get(self) -> T:
         params = {name: provider.get() for name, provider in self.parameters.items()}
@@ -234,6 +246,41 @@ class InstanceProvider(Provider[T], Generic[T]):
         return self.instance
 
 
+class ProviderKeyBinding(Binding):
+    """
+    Binding that binds interface to provider key
+
+
+    bind(SomeInterface).to_provider(SomeInterfaceProvider)
+    """
+    def __init__(self, key: Key, provider_cls: Type[Provider[T]]) -> None:
+        assert isinstance is not None
+        assert issubclass(provider_cls, Provider), provider_cls
+        self._provider_cls = provider_cls
+        self._key = key
+        self._class_injector = ClassInjectorHelper(provider_cls)
+
+    @property
+    def key(self) -> Key:
+        return self._key
+
+    @property
+    def dependencies(self) -> Set[Key]:
+        return self._class_injector.dependencies
+
+    def create_provider(self, providers: Mapping[Key, Provider]) -> Provider[T]:
+        return ProviderProvider(self._class_injector, providers)
+
+
+class ProviderProvider(Provider[T], Generic[T]):
+    def __init__(self, class_injector: ClassInjectorHelper, providers: Mapping[Key, Provider]) -> None:
+        self.class_injector = class_injector
+        self.provider = self.class_injector.create_provider(providers)
+
+    def get(self) -> T:
+        return self.provider.get().get()
+
+
 class LazyProvider(Provider[T], Generic[T]):
     def __init__(self) -> None:
         self._underlying_provider = None  # type: Provider[T]
@@ -264,13 +311,16 @@ class LinkedBindingBuilder(ScopedBindingBuilder):
     def to_instance(self, instance) -> None:
         self._builder.to_instance(instance)
 
+    def to_provider(self, provider_cls) -> ScopedBindingBuilder:
+        return self._builder.to_provider(provider_cls)
+
 
 class AnnotatedBindingBuilder(LinkedBindingBuilder):
     def annotated_with(self, annotation) -> LinkedBindingBuilder:
         return self._builder.annotated_with(annotation)
 
 
-class BindingBuilder(object):
+class BindingBuilder:
     def __init__(self, interface) -> None:
         self._binding = None  # type: Binding
         self._key = Key(interface)
@@ -280,19 +330,22 @@ class BindingBuilder(object):
 
         self._instance = None  # type: Any
         self._impl = None  # type: Any
+        self._provider_cls = None  # type: Any
 
     def build(self) -> Binding:
         if self._instance:
             return InstanceBinding(self._key, self._instance)
         if self._impl:
             return ClassBinding(self._key, self._impl)
+        if self._provider_cls:
+            return ProviderKeyBinding(self._key, self._provider_cls)
 
         # TODO: check if interface is concrete class
         return ClassBinding(self._key, self._key.interface)
 
     def _check_not_bound(self):
-        if self._instance or self._impl:
-            raise RuntimeError('already bound')
+        if self._instance or self._impl or self._provider_cls:
+            raise RuntimeError('{!r} already bound'.format(self._key))
 
     def _set_binding(self, binding: Binding):
         if self._binding is not None:
@@ -312,13 +365,21 @@ class BindingBuilder(object):
         self._scope = scope
 
     def to(self, impl) -> ScopedBindingBuilder:
+        assert impl is not None
         self._check_not_bound()
         self._impl = impl
         return ScopedBindingBuilder(self)
 
     def to_instance(self, instance) -> None:
+        assert instance is not None
         self._check_not_bound()
         self._instance = instance
+
+    def to_provider(self, provider_cls) -> ScopedBindingBuilder:
+        assert provider_cls is not None
+        self._check_not_bound()
+        self._provider_cls = provider_cls
+        return ScopedBindingBuilder(self)
 
 
 class Binder:
@@ -338,7 +399,7 @@ class Binder:
         # add provider bindings
 
         for binding in bindings:
-            provider_binding = AutoProviderBinding(binding)
+            provider_binding = ProviderBinding(binding)
             assert provider_binding.key not in keys_to_bindings, provider_binding
             keys_to_bindings[provider_binding.key] = provider_binding
 
@@ -415,6 +476,7 @@ def test_bind_self():
 
     a = container.get(A)
     assert isinstance(a, A)
+    assert a is not container.get(A)
 
 
 def test_bind_instance():
@@ -601,8 +663,10 @@ def test_unknown_dependency():
 
 
 def test_binding_of_provider_is_disallowed():
+    ProviderInt = Provider[int]  # type: ignore
+
     def configure(binder):
-        binder.bind(Provider[int]).to_instance(InstanceProvider(1))
+        binder.bind(ProviderInt).to_instance(InstanceProvider(1))
 
     with pytest.raises(IllegalConfigurationError):
         Container(configure)
@@ -615,9 +679,53 @@ def test_bind_concrete_generic():
     class AInt(A[int]):
         pass
 
+    AIntInterface = A[int]  # type: ignore
+
     def configure(binder):
-        binder.bind(A[int]).to(AInt)
+        binder.bind(AIntInterface).to(AInt)
 
     c = Container(configure)
 
-    assert type(c.get(A[int])) is AInt
+    assert type(c.get(AIntInterface)) is AInt
+
+
+def test_bind_to_provider():
+    class A:
+        def __init__(self, x):
+            self.x = x
+
+    class AProvider(Provider[A]):
+        def __init__(self, x: str) -> None:
+            self.x = x
+
+        def get(self) -> A:
+            return A(self.x)
+
+    def configure(binder):
+        binder.bind(str).to_instance('dependency')
+        binder.bind(A).to_provider(AProvider)
+
+    a = Container(configure).get(A)
+
+    assert type(a) is A
+    assert a.x == 'dependency'
+
+
+def test_bound_provider_created_every_time_instance_requested():
+    class IntProvider(Provider[int]):
+        call_count = 0
+
+        def __init__(self):
+            IntProvider.call_count += 1
+
+        def get(self) -> int:
+            return 1
+
+    def configure(binder: Binder):
+        binder.bind(int).to_provider(IntProvider)
+
+    c = Container(configure)
+    c.get(int)
+    c.get(int)
+
+    assert IntProvider.call_count == 2
