@@ -1,12 +1,22 @@
 import inspect
+import threading
 from abc import ABC, abstractmethod, abstractproperty
 from collections import deque
-from typing import MutableMapping, TypeVar, Generic, Type, Set, List, Any, Mapping, Hashable, Dict
+from threading import Lock
+from typing import MutableMapping, TypeVar, Generic, Type, Set, List, Any, Mapping, Hashable, Dict, Callable
 
 import pytest  # type: ignore
 
 
 T = TypeVar('T')
+
+
+# TODO:
+# - Annotations (names, ...)
+# - Refactor to set_binding
+# - bind_constant?
+# - More configuration options
+# - AOP
 
 
 class Key(Hashable):
@@ -26,14 +36,20 @@ class Key(Hashable):
         return '<Key (interface={!r}, annotation={!r})>'.format(self.interface, self.annotation)
 
 
+FunctionConfig = Callable[['Binder'], None]
+
+
 class Container:
-    def __init__(self, *configurations: Any) -> None:
+    def __init__(self, *configurations: FunctionConfig) -> None:
         self._providers = {}  # type: MutableMapping[Key, Provider]
         binder = Binder()
         for conf in configurations:
             conf(binder)
         # bind defaults
         binder.bind(Container).to_instance(self)
+        binder.bind_scope(noscope, NoScope())
+        binder.bind_scope(threadlocal, ThreadlocalScope())
+        binder.bind_scope(singleton, SingletonScope())
 
         # build keys-bindings map
         sorted_bindings = binder.sorted_bindings
@@ -103,11 +119,81 @@ class Provider(Generic[T], ABC):
         pass
 
 
-class Binding(ABC):
-    linked_key = None  # type: Key
+class Scope(ABC):
+    @abstractmethod
+    def scope(self, key: Key, unscoped: Provider[T]) -> Provider[T]: ...
 
+    def __repr__(self):
+        return '<{}>'.format(self.__class__.__name__)
+
+
+class NoScope(Scope):
+    def scope(self, key: Key, unscoped: Provider[T]) -> Provider[T]:
+        return unscoped
+
+
+class ThreadlocalScope(Scope):
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def scope(self, key: Key, unscoped: Provider[T]) -> Provider[T]:
+        return ThreadlocalProvider(self._local, key, unscoped)
+
+
+class ThreadlocalProvider(Provider[T], Generic[T]):
+    def __init__(self, threadlocals: threading.local, key: Key, provider: Provider[T]) -> None:
+        self._threadlocals = threadlocals
+        self._key = key
+        self._provider = provider
+
+    def get(self) -> T:
+        key = self._key
+        try:
+            inst = self._threadlocals.__dict__[key]
+        except KeyError:
+            self._threadlocals.__dict__[key] = inst = self._provider.get()
+        return inst
+
+
+class SingletonScope(Scope):
+    def __init__(self):
+        self._providers = {}  # type: Dict[Key, Provider]
+        self._lock = Lock()
+
+    def scope(self, key: Key, unscoped: Provider[T]) -> Provider[T]:
+        try:
+            return self._providers[key]
+        except KeyError:
+            with self._lock:
+                try:
+                    return self._providers[key]
+                except KeyError:
+                    provider = self._providers[key] = InstanceProvider(unscoped.get())
+                    return provider
+
+
+class scope:
+    pass
+
+
+class noscope(scope):
+    pass
+
+
+class threadlocal(scope):
+    pass
+
+
+class singleton(scope):
+    pass
+
+
+class Binding(ABC):
     @abstractproperty
     def key(self) -> Key: ...
+
+    @abstractproperty
+    def linked_key(self) -> Key: ...
 
     @abstractproperty
     def dependencies(self) -> Set[Key]: ...
@@ -161,12 +247,16 @@ class ClassBinding(Binding):
         assert issubclass(cls, key.interface), (cls, key.interface)
         self.cls = cls
         self._key = key
-        self.linked_key = Key(cls)
+        self._linked_key = Key(cls)
         self._class_injector = ClassInjectorHelper(self.cls)
 
     @property
     def key(self) -> Key:
         return self._key
+
+    @property
+    def linked_key(self) -> Key:
+        return self._linked_key
 
     @property
     def dependencies(self) -> Set[Key]:
@@ -231,10 +321,14 @@ class InstanceBinding(Binding):
         return self._key
 
     @property
+    def linked_key(self) -> Key:
+        return None
+
+    @property
     def dependencies(self) -> Set:
         return set()
 
-    def create_provider(self, bindings) -> Provider[T]:
+    def create_provider(self, providers) -> Provider[T]:
         return InstanceProvider(self._instance)
 
 
@@ -265,6 +359,10 @@ class ProviderKeyBinding(Binding):
         return self._key
 
     @property
+    def linked_key(self):
+        return None
+
+    @property
     def dependencies(self) -> Set[Key]:
         return self._class_injector.dependencies
 
@@ -278,6 +376,31 @@ class ProviderProvider(Provider[T], Generic[T]):
 
     def get(self) -> T:
         return self.provider.get().get()
+
+
+class ScopedBinding(Binding):
+    def __init__(self, binding: Binding, scope: Scope) -> None:
+        self._binding = binding
+        self._scope = scope
+
+    @property
+    def key(self) -> Key:
+        return self._binding.key
+
+    @property
+    def linked_key(self) -> Key:
+        return self._binding.linked_key
+
+    @property
+    def dependencies(self) -> Set[Key]:
+        return self._binding.dependencies
+
+    def create_provider(self, providers: Mapping[Key, Provider]) -> Provider:
+        provider = self._binding.create_provider(providers)
+        return self._scope.scope(self.key, provider)
+
+    def __repr__(self):
+        return '<ScopedBinding(binding={!r}, scope={!r})>'.format(self._binding, self._scope)
 
 
 class LazyProvider(Provider[T], Generic[T]):
@@ -325,22 +448,35 @@ class BindingBuilder:
         self._key = Key(interface)
 
         # TODO: try to come up with a narrower type
-        self._scope = None  # type: Any
+        self._scope_type = None  # type: Type[scope]
 
         self._instance = None  # type: Any
         self._impl = None  # type: Any
         self._provider_cls = None  # type: Any
 
-    def build(self) -> Binding:
+    def build(self, scopes: Dict[Type[scope], Scope]) -> Binding:
         if self._instance:
-            return InstanceBinding(self._key, self._instance)
-        if self._impl:
-            return ClassBinding(self._key, self._impl)
-        if self._provider_cls:
-            return ProviderKeyBinding(self._key, self._provider_cls)
+            binding = InstanceBinding(self._key, self._instance)  # type: Binding
+        elif self._impl:
+            binding = ClassBinding(self._key, self._impl)
+        elif self._provider_cls:
+            binding = ProviderKeyBinding(self._key, self._provider_cls)
+        else:
+            # TODO: check if interface is concrete class
+            binding = ClassBinding(self._key, self._key.interface)
 
-        # TODO: check if interface is concrete class
-        return ClassBinding(self._key, self._key.interface)
+        if self._scope_type:
+            try:
+                scope = scopes[self._scope_type]
+            except KeyError:
+                raise IllegalConfigurationError('scope {!r} not bound'.format(self._scope_type))
+        else:
+            scope = None
+
+        if scope:
+            return ScopedBinding(binding, scope)
+        else:
+            return binding
 
     def _check_not_bound(self):
         if self._instance or self._impl or self._provider_cls:
@@ -359,9 +495,9 @@ class BindingBuilder:
 
     def in_scope(self, scope):
         assert scope is not None
-        if self._scope is not None:
+        if self._scope_type is not None:
             raise RuntimeError('scope already set')
-        self._scope = scope
+        self._scope_type = scope
 
     def to(self, impl) -> ScopedBindingBuilder:
         assert impl is not None
@@ -385,10 +521,11 @@ class Binder:
     def __init__(self) -> None:
         self._binding_builders = []  # type: List[BindingBuilder]
         self._lazy_initialized_providers = {}  # type: Dict[Key, LazyProvider]
+        self._scopes = {}  # type: Dict[Type[scope], Scope]
 
     @property
     def sorted_bindings(self) -> List[Binding]:
-        bindings = [b.build() for b in self._binding_builders]
+        bindings = [b.build(self._scopes) for b in self._binding_builders]
         keys_to_bindings = {}  # type: Dict[Key, Binding]
         for binding in bindings:
             key = binding.key
@@ -419,6 +556,12 @@ class Binder:
         builder = BindingBuilder(cls)
         self._binding_builders.append(builder)
         return AnnotatedBindingBuilder(builder)
+
+    def bind_scope(self, scope_ident: Type[scope], scope_impl: Scope):
+        assert issubclass(scope_ident, scope), scope_ident
+        assert isinstance(scope_impl, Scope)
+        assert scope_ident not in self._scopes, 'scope {!r} already bound'.format(scope_ident)
+        self._scopes[scope_ident] = scope_impl
 
     def get_provider(self, interface: Type[T], annotation=None) -> Provider[T]:
         """
@@ -464,11 +607,11 @@ def topsorted(node_to_dependencies):
         raise ValueError(ordered)
 
 
-def test_bind_self():
+def test_bind_self() -> None:
     class A:
         pass
 
-    def configure(binder):
+    def configure(binder: Binder):
         binder.bind(A)
 
     container = Container(configure)
@@ -478,19 +621,19 @@ def test_bind_self():
     assert a is not container.get(A)
 
 
-def test_bind_instance():
-    def configure(binder):
+def test_bind_instance() -> None:
+    def configure(binder: Binder):
         binder.bind(int).to_instance(10)
 
     assert Container(configure).get(int) == 10
 
 
-def test_bind_dependency():
+def test_bind_dependency() -> None:
     class A:
         def __init__(self, x: int) -> None:
             self.x = x
 
-    def configure(binder):
+    def configure(binder: Binder):
         binder.bind(int).to_instance(1)
         binder.bind(A)
 
@@ -499,14 +642,14 @@ def test_bind_dependency():
     assert a.x == 1
 
 
-def test_bind_interface():
+def test_bind_interface() -> None:
     class A(ABC):
         pass
 
     class AImpl(A):
         pass
 
-    def configure(binder):
+    def configure(binder: Binder):
         binder.bind(A).to(AImpl)
 
     container = Container(configure)
@@ -516,15 +659,15 @@ def test_bind_interface():
     assert type(a) is AImpl
 
 
-def test_late_dependencies_order():
+def test_late_dependencies_order() -> None:
     class A:
         def __init__(self, x: int) -> None:
             self.x = x
 
-    def configure1(binder):
+    def configure1(binder: Binder):
         binder.bind(A)
 
-    def configure2(binder):
+    def configure2(binder: Binder):
         binder.bind(int).to_instance(1)
 
     a = Container(configure1, configure2).get(A)
@@ -532,7 +675,7 @@ def test_late_dependencies_order():
     assert a.x == 1
 
 
-def test_linked_binding():
+def test_linked_binding() -> None:
     class A:
         pass
 
@@ -549,7 +692,7 @@ def test_linked_binding():
         def __init__(self, a: A) -> None:
             self.a = a
 
-    def configure(binder):
+    def configure(binder: Binder):
         binder.bind(A).to(B)
         binder.bind(B).to(C)
         binder.bind(C).to(D)
@@ -569,7 +712,7 @@ def test_linked_binding():
     assert type(container.get(Dep).a) is D
 
 
-def test_linked_to_instance():
+def test_linked_to_instance() -> None:
     class A:
         pass
     class B(A):
@@ -579,15 +722,15 @@ def test_linked_to_instance():
 
     c = C()
 
-    def configure(binder):
+    def configure(binder: Binder):
         binder.bind(A).to(B)
         binder.bind(B).to_instance(c)
 
     assert Container(configure).get(A) is c
 
 
-def test_duplicate_binding():
-    def configure(binder):
+def test_duplicate_binding() -> None:
+    def configure(binder: Binder):
         binder.bind(int).to_instance(1)
         binder.bind(int).to_instance(2)
 
@@ -600,28 +743,31 @@ def test_container_provides_self():
     assert c.get(Container) is c
 
 
-def test_provides_provider():
-    def configure(binder):
+def test_provides_provider() -> None:
+    def configure(binder: Binder) -> None:
         binder.bind(int).to_instance(1)
 
     c = Container(configure)
 
-    int_provider = c.get(Provider[int])  # type: ignore
+    # mypy doesn't support type aliases for generics
+    # https://github.com/python/mypy/issues/606
+    ProviderInt = Provider[int]  # type: ignore
+    int_provider = c.get(ProviderInt)  # type: ProviderInt
     assert int_provider.get() == 1
 
 
-def test_key():
+def test_key() -> None:
     k1 = Key(List[int])  # type: ignore
     k2 = Key(List[int])  # type: ignore
     assert k1 == k2
     assert hash(k2) == hash(k2)
 
 
-def test_binder_get_provider():
+def test_binder_get_provider() -> None:
     class A:
-        pass
+        provider = None  # type: Provider[int]
 
-    def configure(binder):
+    def configure(binder: Binder):
         provider = binder.get_provider(int)
         with pytest.raises(IllegalStateException):
             provider.get()
@@ -635,7 +781,7 @@ def test_binder_get_provider():
     assert a.provider.get() == 1
 
 
-def test_dependency_on_provider():
+def test_dependency_on_provider() -> None:
     class A:
         def __init__(self, x: Provider[int]) -> None:
             self.x = x
@@ -649,29 +795,29 @@ def test_dependency_on_provider():
     assert c.get(A).x.get() == 1
 
 
-def test_unknown_dependency():
+def test_unknown_dependency() -> None:
     class A:
         def __init__(self, x: int) -> None:
             pass
 
-    def configure(binder):
+    def configure(binder: Binder):
         binder.bind(A)
 
     with pytest.raises(KeyNotBoundError):
         Container(configure)
 
 
-def test_binding_of_provider_is_disallowed():
+def test_binding_of_provider_is_disallowed() -> None:
     ProviderInt = Provider[int]  # type: ignore
 
-    def configure(binder):
+    def configure(binder: Binder) -> None:
         binder.bind(ProviderInt).to_instance(InstanceProvider(1))
 
     with pytest.raises(IllegalConfigurationError):
         Container(configure)
 
 
-def test_bind_concrete_generic():
+def test_bind_concrete_generic() -> None:
     class A(Generic[T]):
         pass
 
@@ -680,7 +826,7 @@ def test_bind_concrete_generic():
 
     AIntInterface = A[int]  # type: ignore
 
-    def configure(binder):
+    def configure(binder: Binder):
         binder.bind(AIntInterface).to(AInt)
 
     c = Container(configure)
@@ -688,7 +834,7 @@ def test_bind_concrete_generic():
     assert type(c.get(AIntInterface)) is AInt
 
 
-def test_bind_to_provider():
+def test_bind_to_provider() -> None:
     class A:
         def __init__(self, x):
             self.x = x
@@ -700,7 +846,7 @@ def test_bind_to_provider():
         def get(self) -> A:
             return A(self.x)
 
-    def configure(binder):
+    def configure(binder: Binder):
         binder.bind(str).to_instance('dependency')
         binder.bind(A).to_provider(AProvider)
 
@@ -710,7 +856,7 @@ def test_bind_to_provider():
     assert a.x == 'dependency'
 
 
-def test_bound_provider_created_every_time_instance_requested():
+def test_bound_provider_created_every_time_instance_requested() -> None:
     class IntProvider(Provider[int]):
         call_count = 0
 
@@ -728,3 +874,57 @@ def test_bound_provider_created_every_time_instance_requested():
     c.get(int)
 
     assert IntProvider.call_count == 2
+
+
+def test_no_scope() -> None:
+    class A:
+        pass
+
+    def configure(binder: Binder):
+        binder.bind(A).in_scope(noscope)
+
+    c = Container(configure)
+    assert c.get(A) is not c.get(A)
+
+
+def test_singleton_scope() -> None:
+    class A:
+        pass
+
+    def configure(binder: Binder):
+        binder.bind(A).in_scope(singleton)
+
+    c = Container(configure)
+    assert c.get(A) is c.get(A)
+    assert type(c.get(A)) is A
+
+
+def test_threadlocal_scope() -> None:
+    class A:
+        pass
+
+    def configure(binder: Binder):
+        binder.bind(A).in_scope(threadlocal)
+
+    c = Container(configure)
+
+    thread1_a1 = c.get(A)
+    thread1_a2 = c.get(A)
+    thread2_a1 = None
+    thread2_a2 = None
+
+    def init_thread2_a():
+        nonlocal thread2_a1
+        nonlocal thread2_a2
+        thread2_a1 = c.get(A)
+        thread2_a2 = c.get(A)
+
+    t = threading.Thread(target=init_thread2_a)
+    t.start()
+    t.join()
+
+    assert type(thread1_a1) is A
+    assert type(thread2_a1) is A
+    assert thread1_a1 is thread1_a2
+    assert thread2_a1 is thread2_a2
+    assert thread1_a1 is not thread2_a1
