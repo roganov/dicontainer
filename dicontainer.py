@@ -46,14 +46,14 @@ class Container:
         # collapse linked bindings
         for binding in sorted_bindings:
             key = binding.key
-            possible_link = binding.linked_to
+            possible_link = binding.linked_key
             while (
                 possible_link is not None and  # has link
                 key != possible_link and  # not linked to self
                 possible_link in keys_to_bindings  # link has binding
             ):
                 keys_to_bindings[key] = keys_to_bindings[possible_link]
-                possible_link = keys_to_bindings[possible_link].linked_to
+                possible_link = keys_to_bindings[possible_link].linked_key
 
         # build keys-providers map
         for key in sorted_keys:
@@ -104,7 +104,7 @@ class Provider(Generic[T], ABC):
 
 
 class Binding(ABC):
-    linked_to = None  # type: Key
+    linked_key = None  # type: Key
 
     @abstractproperty
     def key(self) -> Key: ...
@@ -131,14 +131,14 @@ class ProviderBinding(Binding):
         self._internal_binding = internal_binding
         self._key = provider_key(internal_binding.key)
 
-        if self._internal_binding.linked_to:
-            self._linked_to = provider_key(self._internal_binding.linked_to)
+        if self._internal_binding.linked_key:
+            self._linked_key = provider_key(self._internal_binding.linked_key)
         else:
-            self._linked_to = None
+            self._linked_key = None
 
     @property
-    def linked_to(self):
-        return self._linked_to
+    def linked_key(self):
+        return self._linked_key
 
     @property
     def key(self):
@@ -161,7 +161,7 @@ class ClassBinding(Binding):
         assert issubclass(cls, key.interface), (cls, key.interface)
         self.cls = cls
         self._key = key
-        self.linked_to = Key(cls)
+        self.linked_key = Key(cls)
         self._class_injector = ClassInjectorHelper(self.cls)
 
     @property
@@ -274,8 +274,7 @@ class ProviderKeyBinding(Binding):
 
 class ProviderProvider(Provider[T], Generic[T]):
     def __init__(self, class_injector: ClassInjectorHelper, providers: Mapping[Key, Provider]) -> None:
-        self.class_injector = class_injector
-        self.provider = self.class_injector.create_provider(providers)
+        self.provider = class_injector.create_provider(providers)
 
     def get(self) -> T:
         return self.provider.get().get()
