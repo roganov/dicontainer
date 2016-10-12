@@ -3,8 +3,9 @@ import threading
 from abc import ABC, abstractmethod, abstractproperty
 from collections import deque
 from threading import Lock
-from typing import MutableMapping, TypeVar, Generic, Type, Set, List, Mapping, Hashable, Dict, Callable, Optional, Any, \
-    Iterable
+from typing import MutableMapping, TypeVar, Generic, Type, Set, List, Mapping, Dict, Callable, Optional, Any, \
+    get_type_hints
+from typing import no_type_check_decorator  # type: ignore
 
 import pytest  # type: ignore
 
@@ -13,14 +14,92 @@ T = TypeVar('T')
 # TODO:
 # - Annotations (names, ...)
 # - Refactor to set_binding
+# - JIT bindings
+# - request_injections
 # - bind_constant?
+# - inject_members
 # - More configuration options
 # - AOP
 
-AnnotationType = Hashable
+
+# Guice differences
+# - .to_instance doest not inject provided instance
 
 
-class Key(Hashable, Generic[T]):
+NoneType = type(None)
+
+
+class AnnotationType(ABC):
+
+    @abstractmethod
+    def __hash__(self) -> int:
+        raise NotImplemented
+
+    @abstractmethod
+    def __eq__(self, other: object) -> bool:
+        raise NotImplemented
+
+
+class Named(AnnotationType):
+    __slots__ = ('name', )
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __hash__(self) -> int:
+        return hash((self.__class__, self.name))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Named):
+            return False
+        return self.name == other.name
+
+    def __repr__(self) -> str:
+        return '<Named({!r})>'.format(self.name)
+
+
+TCallable = TypeVar('TCallable', bound=Callable[..., Any])
+
+
+@no_type_check_decorator
+# https://github.com/python/mypy/issues/1551
+# https://github.com/python/mypy/issues/2242
+def inject(**kwargs: AnnotationType) -> Callable[[TCallable], TCallable]:
+    def decorate(fun: TCallable) -> TCallable:
+        # https://github.com/python/typeshed/issues/318
+        if isinstance(fun, staticmethod):  # type: ignore
+            raise ValueError('staticmethods cannot be decorated with `inject`')
+
+        signature = inspect.signature(fun)
+        extra_params = set(kwargs).difference(signature.parameters.keys())
+        if extra_params:
+            raise ValueError('@inject decorator on {!r} has invalid parameters {}'
+                             .format(fun, extra_params))
+        try:
+            injections = fun.__injections__  # type: ignore
+        except AttributeError:
+            injections = fun.__injections__ = {}  # type: ignore
+        for name, annotation in kwargs.items():
+            if name in injections:
+                raise ValueError('duplicate config for {} on {!r}'
+                                 .format(name, fun))
+            injections[name] = annotation
+        return fun
+    return decorate
+
+
+def get_injections(fun: Callable[..., Any]) -> Optional[Dict[str, AnnotationType]]:
+    try:
+        injections = fun.__injections__  # type: ignore
+    except AttributeError:
+        return None
+    else:
+        if not isinstance(injections, dict):
+            raise RuntimeError('unexpected type')
+        return injections
+
+
+class Key(Generic[T]):
     def __init__(self, interface: Type[T],
                  annotation: AnnotationType=None) -> None:
         self.interface = interface
@@ -44,7 +123,7 @@ FunctionConfig = Callable[['Binder'], None]
 
 class Container:
     def __init__(self, *configurations: FunctionConfig) -> None:
-        self._providers = {}  # type: MutableMapping[Key, Provider]
+        self._providers = {}  # type: Dict[Key, Provider]
         binder = Binder()
         for conf in configurations:
             conf(binder)
@@ -86,11 +165,11 @@ class Container:
                 raise KeyNotBoundError(key)
             lazy_provider.initialize(provider)
 
-    def get(self, cls: Type[T]) -> T:
-        return self.get_provider(cls).get()
+    def get(self, cls: Type[T], annotation: AnnotationType = None) -> T:
+        return self.get_provider(cls, annotation).get()
 
-    def get_provider(self, cls: Type[T]) -> 'Provider[T]':
-        key = Key(cls)
+    def get_provider(self, cls: Type[T], annotation: AnnotationType = None) -> 'Provider[T]':
+        key = Key(cls, annotation)
         providers_map = self._providers
         try:
             provider = providers_map[key]
@@ -231,9 +310,9 @@ class ProviderBinding(Binding[Provider[T]], Generic[T]):
         self._key = provider_key(internal_binding.key)
 
         if self._internal_binding.linked_key:
+            linked = self._internal_binding.linked_key
             self._linked_key = provider_key(
-                self._internal_binding.
-                linked_key)  # type: Optional[Key[Provider]]
+                linked)  # type: Optional[Key[Provider]]
         else:
             self._linked_key = None
 
@@ -287,7 +366,7 @@ class ClassBinding(Binding[T], Generic[T]):
 class ClassInjectorHelper(Generic[T]):
     def __init__(self, cls: Type[T]) -> None:
         self._cls = cls
-        self._param_names_to_keys = get_keys_from_constructor(cls.__init__)
+        self._param_names_to_keys = get_keys(cls.__init__)
 
     @property
     def dependencies(self) -> Set[Key]:
@@ -302,19 +381,41 @@ class ClassInjectorHelper(Generic[T]):
         return ClassProvider(self._cls, param_names_to_providers)
 
 
-def get_keys_from_constructor(ctor: Any) -> Mapping[str, Key]:
-    if ctor is object.__init__:
+def get_keys(fun: Any) -> Mapping[str, Key]:
+    if isinstance(fun, staticmethod):  # type: ignore
+        raise ValueError('cannot get keys staticmethod')
+    if fun is object.__init__:
         return {}
-    sig = inspect.signature(ctor)
+    sig = inspect.signature(fun)
+    inject_annotations = get_injections(fun)
     param_names_to_keys = {}  # type: Dict[str, Key]
-    for parameter_name in list(sig.parameters.keys())[
-            1:]:  # skip first param (self)
+    type_hints = get_type_hints(fun)
+    # skip first param (self or cls)
+    for parameter_name in list(sig.parameters.keys())[1:]:
         parameter = sig.parameters[parameter_name]
-        if parameter.annotation is inspect.Parameter.empty:
-            raise ValueError('parameter {} has no annotation'.format(
-                parameter.name))
-        param_names_to_keys[parameter.name] = Key(parameter.annotation)
+        if parameter_name not in type_hints:
+            raise ValueError('parameter {} has no annotation'
+                             .format(parameter.name))
+        type_hint = type_hints[parameter_name]
+        type_hint = _try_unwrap_optional(type_hint)
+
+        if inject_annotations is None:
+            inject_annotation = None
+        else:
+            inject_annotation = inject_annotations.get(parameter_name)
+        param_names_to_keys[parameter.name] = Key(type_hint,
+                                                  inject_annotation)
     return param_names_to_keys
+
+
+def _try_unwrap_optional(type_hint: Any) -> Any:
+    union_params = getattr(type_hint, '__union_params__', None)
+    if union_params and len(union_params) == 2:
+        if union_params[0] is NoneType:
+            return union_params[1]
+        elif union_params[1] is NoneType:
+            return union_params[0]
+    return type_hint
 
 
 class ClassProvider(Provider[T], Generic[T]):
@@ -351,7 +452,7 @@ class InstanceBinding(Binding[T], Generic[T]):
         return None
 
     @property
-    def dependencies(self) -> Set:
+    def dependencies(self) -> Set[Key]:
         return set()
 
     def create_provider(self,
@@ -496,6 +597,10 @@ class BindingBuilder(Generic[T]):
         elif self._provider_cls:
             binding = ProviderKeyBinding(self._key, self._provider_cls)
         else:
+            if self._key.annotation is not None:
+                raise IllegalConfigurationError(
+                    'annotated key {!r} must be explicitly bound'
+                    .format(self._key))
             # TODO: check if interface is concrete class
             binding = ClassBinding(self._key, self._key.interface)
 
@@ -577,10 +682,13 @@ class Binder:
             for b in keys_to_bindings.values()
         }
         sorted_keys = topsorted(keys_dependencies_graph)
-        try:
-            return [keys_to_bindings[key] for key in sorted_keys]
-        except KeyError:
-            raise KeyNotBoundError(key)
+        out = []
+        for key in sorted_keys:
+            try:
+                out.append(keys_to_bindings[key])
+            except KeyError:
+                raise KeyNotBoundError(Key)
+        return out
 
     def bind(self, cls: Type[T]) -> AnnotatedBindingBuilder[T]:
         if issubclass(cls, Provider):
@@ -968,3 +1076,142 @@ def test_threadlocal_scope() -> None:
     assert thread1_a1 is thread1_a2
     assert thread2_a1 is thread2_a2
     assert thread1_a1 is not thread2_a1
+
+
+def test_bind_annotated() -> None:
+    def configure(binder: Binder) -> None:
+        (binder.bind(str)
+            .annotated_with(Named('foo'))
+            .to_instance('bar'))
+
+    c = Container(configure)
+    assert c.get(str, Named('foo')) == 'bar'
+
+    with pytest.raises(KeyNotBoundError):
+        c.get(str)
+
+    with pytest.raises(KeyNotBoundError):
+        c.get(str, Named('baz'))
+
+
+def test_inject_annotated() -> None:
+    class A:
+        @inject(a=Named('foo'))
+        def __init__(self, a: str, b: int) -> None:
+            self.a = a
+            self.b = b
+
+    def configure(binder: Binder) -> None:
+        (binder.bind(str)
+             .annotated_with(Named('foo'))
+             .to_instance('bar'))
+        binder.bind(int).to_instance(1)
+        binder.bind(A)
+
+    c = Container(configure)
+
+    a = c.get(A)  # type: A
+    assert a.a == 'bar'
+    assert a.b == 1
+
+
+def test_custom_annotation() -> None:
+    class MyAnnotation(AnnotationType):
+        def __hash__(self) -> int:
+            return 0
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, MyAnnotation)
+
+    def configure(binder: Binder) -> None:
+        binder.bind(int).annotated_with(MyAnnotation()).to_instance(1)
+
+    assert Container(configure).get(int, MyAnnotation()) == 1
+
+
+def test_inject_decorator() -> None:
+    class A:
+        @inject(x=Named('foo'))
+        def f(self, x: str) -> None:
+            pass
+
+        @inject()
+        def decorator_called_without_params(self) -> None:
+            pass
+
+        def not_decorated(self) -> None:
+            pass
+
+    assert get_injections(A.f) == {'x': Named('foo')}
+    assert get_injections(A.decorator_called_without_params) == {}
+    assert get_injections(A.not_decorated) is None
+
+    with pytest.raises(ValueError):
+        class B:
+            @inject()
+            @staticmethod
+            def s() -> None:
+                pass
+
+    with pytest.raises(ValueError):
+        class C:
+            @inject(x=Named('foo'))
+            def inject_decorator_has_extra_params(self, y: str) -> None:
+                pass
+
+
+def test_named() -> None:
+    assert Named('equal') == Named('equal')
+
+    assert Named('1') != Named('2')
+
+
+def test_get_keys_from_func() -> None:
+    class A:
+        @inject(y = Named('foo'))
+        def __init__(self, x: int, y: str) -> None:
+            pass
+
+    keys = get_keys(A.__init__)
+    assert keys == {'x': Key(int), 'y': Key(str, Named('foo'))}
+
+
+def test_get_keys_unwraps_optional() -> None:
+    class A:
+        def __init__(self, x: Optional[int]) -> None:
+            pass
+
+    assert get_keys(A.__init__) == {'x': Key(int)}
+
+
+class DependsOnForwardB:
+    def __init__(self, b: 'B') -> None:
+        pass
+
+
+class B:
+    pass
+
+
+def test_forward_references_should_work() -> None:
+
+    def configure(binder: Binder) -> None:
+        binder.bind(DependsOnForwardB)
+        binder.bind(B)
+
+    # test doesn't produce an error
+    Container(configure).get(DependsOnForwardB)
+
+
+def test_should_be_able_to_provide_optionals() -> None:
+    class A:
+        def __init__(self, x: Optional[int]) -> None:
+            self.x = x
+
+    def configure(binder: Binder) -> None:
+        binder.bind(A)
+        binder.bind(int).to_instance(2)
+
+    a = Container(configure).get(A)
+
+    assert a.x == 2
