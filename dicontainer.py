@@ -4,22 +4,21 @@ from abc import ABC, abstractmethod, abstractproperty
 from collections import deque
 from threading import Lock
 from typing import MutableMapping, TypeVar, Generic, Type, Set, List, Mapping, Dict, Callable, Optional, Any, \
-    get_type_hints
-from typing import no_type_check_decorator  # type: ignore
+    get_type_hints, cast
 
 import pytest  # type: ignore
 
 T = TypeVar('T')
 
 # TODO:
-# - Annotations (names, ...)
 # - Refactor to set_binding
 # - JIT bindings
 # - request_injections
 # - bind_constant?
 # - inject_members
+# - multibind
 # - More configuration options
-# - AOP
+# - AOP (__wrapped__)
 
 
 # Guice differences
@@ -61,11 +60,18 @@ class Named(AnnotationType):
 TCallable = TypeVar('TCallable', bound=Callable[..., Any])
 
 
-@no_type_check_decorator
-# https://github.com/python/mypy/issues/1551
-# https://github.com/python/mypy/issues/2242
-def inject(**kwargs: AnnotationType) -> Callable[[TCallable], TCallable]:
-    def decorate(fun: TCallable) -> TCallable:
+class inject:
+    def __init__(self, **kwargs: AnnotationType) -> None:
+        self.kwargs = kwargs
+
+    def __call__(self, fun: TCallable) -> TCallable:
+        # workaround for https://github.com/python/mypy/issues/2242
+        # instead of decorating __init__, allow to decorate class itself
+        cls = None  # type: Optional[TCallable]
+        if inspect.isclass(fun):
+            cls = fun
+            fun = fun.__init__  # type: ignore
+        kwargs = self.kwargs
         # https://github.com/python/typeshed/issues/318
         if isinstance(fun, staticmethod):  # type: ignore
             raise ValueError('staticmethods cannot be decorated with `inject`')
@@ -84,13 +90,15 @@ def inject(**kwargs: AnnotationType) -> Callable[[TCallable], TCallable]:
                 raise ValueError('duplicate config for {} on {!r}'
                                  .format(name, fun))
             injections[name] = annotation
+
+        if cls:
+            return cls
         return fun
-    return decorate
 
 
 def get_injections(fun: Callable[..., Any]) -> Optional[Dict[str, AnnotationType]]:
     try:
-        injections = fun.__injections__  # type: ignore
+        injections = cast(Any, fun).__injections__
     except AttributeError:
         return None
     else:
@@ -396,8 +404,7 @@ def get_keys(fun: Any) -> Mapping[str, Key]:
         if parameter_name not in type_hints:
             raise ValueError('parameter {} has no annotation'
                              .format(parameter.name))
-        type_hint = type_hints[parameter_name]
-        type_hint = _try_unwrap_optional(type_hint)
+        type_hint = _try_unwrap_optional(type_hints[parameter_name])
 
         if inject_annotations is None:
             inject_annotation = None
@@ -1095,8 +1102,8 @@ def test_bind_annotated() -> None:
 
 
 def test_inject_annotated() -> None:
+    @inject(a=Named('foo'))
     class A:
-        @inject(a=Named('foo'))
         def __init__(self, a: str, b: int) -> None:
             self.a = a
             self.b = b
@@ -1110,7 +1117,7 @@ def test_inject_annotated() -> None:
 
     c = Container(configure)
 
-    a = c.get(A)  # type: A
+    a = c.get(A)
     assert a.a == 'bar'
     assert a.b == 1
 
