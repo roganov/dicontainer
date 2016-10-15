@@ -4,15 +4,13 @@ from abc import ABC, abstractmethod, abstractproperty
 from collections import deque
 from threading import Lock
 from typing import MutableMapping, TypeVar, Generic, Type, Set, List, Mapping, Dict, Callable, Optional, Any, \
-    get_type_hints, cast
-
+    get_type_hints, cast, Union
 import pytest  # type: ignore
 
 T = TypeVar('T')
 
 # TODO:
 # - Refactor to set_binding
-# - JIT bindings
 # - request_injections
 # - bind_constant?
 # - inject_members
@@ -132,6 +130,7 @@ FunctionConfig = Callable[['Binder'], None]
 class Container:
     def __init__(self, *configurations: FunctionConfig) -> None:
         self._providers = {}  # type: Dict[Key, Provider]
+        self._jit_providers = {}  # type: Dict[Key, Provider]
         binder = Binder()
         for conf in configurations:
             conf(binder)
@@ -177,13 +176,34 @@ class Container:
         return self.get_provider(cls, annotation).get()
 
     def get_provider(self, cls: Type[T], annotation: AnnotationType = None) -> 'Provider[T]':
+        """
+        Raises: KeyNotBoundError
+        """
         key = Key(cls, annotation)
-        providers_map = self._providers
         try:
-            provider = providers_map[key]
+            provider = self._providers[key]
         except KeyError:
-            raise KeyNotBoundError(key)
+            try:
+                provider = self._jit_providers[key]
+            except KeyError:
+                provider = self._create_jit_provider(key)
         return provider
+
+    def _create_jit_provider(self, key: 'Key[T]') -> 'Provider[T]':
+        if key.annotation is not None:
+            raise KeyNotBoundError(key, 'cannot create jit binding for annotated key')
+        with _jit_provider_lock:
+            try:
+                return self._jit_providers[key]
+            except KeyError:
+                pass
+            class_injector = ClassInjectorHelper(key.interface)
+            provider = class_injector.create_provider(self._providers)
+            self._jit_providers[key] = provider
+            return provider
+
+
+_jit_provider_lock = Lock()
 
 
 class DuplicateBindingError(Exception):
@@ -191,7 +211,16 @@ class DuplicateBindingError(Exception):
 
 
 class KeyNotBoundError(Exception):
-    pass
+    def __init__(self, keys: Union[Key, Set[Key]], message='') -> None:
+        if isinstance(keys, Key):
+            keys = {keys}
+        self.keys = keys  # type: Set[Key]
+        self.message = message
+
+    def __str__(self) -> str:
+        return 'Some dependencies were not satisfied: {!r}\n{}'.format(
+            self.keys, self.message)
+
 
 
 class IllegalStateException(Exception):
@@ -382,10 +411,14 @@ class ClassInjectorHelper(Generic[T]):
 
     def create_provider(self,
                         providers: Mapping[Key, Provider]) -> Provider[T]:
-        param_names_to_providers = {
-            name: providers[key]
-            for name, key in self._param_names_to_keys.items()
-        }
+        try:
+            param_names_to_providers = {
+                name: providers[key]
+                for name, key in self._param_names_to_keys.items()
+            }
+        except KeyError:
+            raise KeyNotBoundError(
+                self.dependencies.difference(providers.keys()))
         return ClassProvider(self._cls, param_names_to_providers)
 
 
@@ -596,20 +629,23 @@ class BindingBuilder(Generic[T]):
         self._provider_cls = None  # type: Optional[Type[Provider[T]]]
 
     def build(self, scopes: Dict[Type[scope], Scope]) -> Binding[T]:
+        key = self._key
         if self._instance:
-            binding = InstanceBinding(self._key,
+            binding = InstanceBinding(key,
                                       self._instance)  # type: Binding
         elif self._impl:
-            binding = ClassBinding(self._key, self._impl)
+            binding = ClassBinding(key, self._impl)
         elif self._provider_cls:
-            binding = ProviderKeyBinding(self._key, self._provider_cls)
+            binding = ProviderKeyBinding(key, self._provider_cls)
         else:
-            if self._key.annotation is not None:
+            if key.annotation is not None:
                 raise IllegalConfigurationError(
                     'annotated key {!r} must be explicitly bound'
-                    .format(self._key))
-            # TODO: check if interface is concrete class
-            binding = ClassBinding(self._key, self._key.interface)
+                    .format(key))
+            if inspect.isabstract(key.interface):
+                raise IllegalConfigurationError(
+                    'untargeted binding for key {!r} cannot be abstract'.format(key))
+            binding = ClassBinding(key, key.interface)
 
         if self._scope_type:
             try:
@@ -694,7 +730,7 @@ class Binder:
             try:
                 out.append(keys_to_bindings[key])
             except KeyError:
-                raise KeyNotBoundError(Key)
+                raise KeyNotBoundError(key)
         return out
 
     def bind(self, cls: Type[T]) -> AnnotatedBindingBuilder[T]:
@@ -1091,11 +1127,16 @@ def test_bind_annotated() -> None:
             .annotated_with(Named('foo'))
             .to_instance('bar'))
 
+    @inject(x=Named('unknown'))
+    class HasNotBoundDependency:
+        def __init__(self, x: str) -> None:
+            pass
+
     c = Container(configure)
     assert c.get(str, Named('foo')) == 'bar'
 
     with pytest.raises(KeyNotBoundError):
-        c.get(str)
+        c.get(HasNotBoundDependency)
 
     with pytest.raises(KeyNotBoundError):
         c.get(str, Named('baz'))
@@ -1222,3 +1263,72 @@ def test_should_be_able_to_provide_optionals() -> None:
     a = Container(configure).get(A)
 
     assert a.x == 2
+
+
+def test_should_support_jit_bindings_without_dependencies() -> None:
+    class A:
+        pass
+
+    c = Container()
+    assert isinstance(c.get(A), A)
+
+
+def test_annotated_jit_bindings_are_disallowed() -> None:
+    class A:
+        pass
+
+    with pytest.raises(KeyNotBoundError):
+        Container().get(A, Named('a'))
+
+
+def test_should_support_jit_bindings_with_dependencies() -> None:
+    def configure(binder: Binder) -> None:
+        binder.bind(str).to_instance('1')
+
+    class A:
+        def __init__(self, x: str) -> None:
+            self.x = x
+
+    a = Container(configure).get(A)
+    assert isinstance(a, A)
+    assert a.x == '1'
+
+
+def test_jit_providers_are_cached() -> None:
+    c = Container()
+
+    assert c.get_provider(int) is c.get_provider(int)
+
+
+def test_jit_providers_are_not_scoped() -> None:
+    class A:
+        pass
+
+    c = Container()
+    assert c.get(A) is not c.get(A)
+
+
+def test_untargeted_abstract_bindings_are_not_allowed() -> None:
+    class A(ABC):
+        @abstractmethod
+        def foo(self) -> None: pass
+
+    def configure(binder: Binder) -> None:
+        binder.bind(A)
+
+    with pytest.raises(IllegalConfigurationError):
+        Container(configure)
+
+
+def test_cannot_provide_jit_binding_with_missing_dependency() -> None:
+    class HasUnknownDependency:
+        def __init__(self, x: int):
+            pass
+
+    c = Container()
+    try:
+        c.get(HasUnknownDependency)
+    except KeyNotBoundError as e:
+        assert e.keys == {Key(int)}
+    else:
+        pytest.fail('should have hit exception')
